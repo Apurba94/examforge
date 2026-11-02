@@ -205,17 +205,45 @@ class App:
                 allowed = True
                 if method in methods:
                     req = Request(method, parts.path, query, form, m.groupdict())
-                    try:
-                        with self.lock:
-                            out = fn(req, **m.groupdict())
-                    except Fail as exc:
-                        return _status(self.page("Please check this", f'<div class="card"><p class="bad">{h(str(exc))}</p><p><a href="javascript:history.back()">Go back</a></p></div>'), exc.status)
-                    except sqlite3.IntegrityError as exc:
-                        return _status(self.page("Please check this", f'<div class="card"><p class="bad">That conflicts with existing records.</p><p class="muted">{h(str(exc))}</p></div>'), 409)
-                    return out if isinstance(out, Response) else self.page(self.title, out)
+                    with self.lock:
+                        return self._call(fn, req, m.groupdict())
         if allowed:
             return Response("method not allowed", 405, "text/plain")
         return _status(self.page("Not found", '<div class="card">There is nothing here.</div>'), 404)
+
+    def _call(self, fn, req, params):
+        """Run a handler. A POST is one transaction, so a form either saves fully or not at all."""
+        write = req.method == "POST"
+        if write:
+            self.run("BEGIN")
+        try:
+            out = fn(req, **params)
+        except Fail as exc:
+            self._undo(write)
+            return _status(self.page("Please check this", f'<div class="card"><p class="bad">{h(str(exc))}</p><p><a href="javascript:history.back()">Go back</a></p></div>'), exc.status)
+        except sqlite3.IntegrityError as exc:
+            self._undo(write)
+            return _status(self.page("Please check this", f'<div class="card"><p class="bad">That conflicts with existing records.</p><p class="muted">{h(str(exc))}</p></div>'), 409)
+        except BaseException:
+            self._undo(write)
+            raise
+        if write:
+            self.run("COMMIT")
+        return out if isinstance(out, Response) else self.page(self.title, out)
+
+    def _undo(self, write):
+        if write and self.c.in_transaction:
+            self.run("ROLLBACK")
+
+    def close(self):
+        self.c.close()
+
+    def __del__(self):
+        try:
+            if self.shared:
+                self.shared.close()
+        except Exception:
+            pass
 
     def get(self, target):
         return self.handle("GET", target)
